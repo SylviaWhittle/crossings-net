@@ -6,6 +6,7 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 import numpy as np
+import numpy.typing as npt
 import matplotlib.pyplot as plt
 
 from src.resunet import ResUNet
@@ -33,6 +34,9 @@ SAMPLE_TYPES = [
 NUM_SAMPLES_PER_TYPE = [100, 0]  # number of samples to grab from each sample type
 TRAINING_DATA_DIR = BASE_DIR / "training"
 ALLOW_TOO_FEW_SAMPLES = True
+AUGMENTATION_FLIP_ROT = True
+AUGMENTATION_SCALE = True
+AUGMENTATION_SCALE_MAX_ZOOM_PERCENTAGE = 0.1
 
 
 def sample_type_split(
@@ -158,8 +162,24 @@ def get_loaders(
 
     # train_dataset = load_data(train_image_files, train_mask_files, vmin=vmin, vmax=vmax)
     # val_dataset = load_data(val_image_files, val_mask_files, vmin=vmin, vmax=vmax)
-    train_dataset = SegmentationDataset(train_image_files, train_mask_files, vmin=vmin, vmax=vmax, augment=True)
-    val_dataset = SegmentationDataset(val_image_files, val_mask_files, vmin=vmin, vmax=vmax, augment=False)
+    train_dataset = SegmentationDataset(
+        train_image_files,
+        train_mask_files,
+        vmin=vmin,
+        vmax=vmax,
+        augment_flip_rot=True,
+        augment_scale=True,
+        augment_max_zoom_percentage=0.1,
+    )
+    val_dataset = SegmentationDataset(
+        val_image_files,
+        val_mask_files,
+        vmin=vmin,
+        vmax=vmax,
+        augment_flip_rot=False,
+        augment_scale=False,
+        augment_max_zoom_percentage=0.1,
+    )
 
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
@@ -226,6 +246,52 @@ def validate(
     return epoch_loss
 
 
+def zoom_and_shift(
+    image: npt.NDArray[np.float64], ground_truth: npt.NDArray[np.bool_], max_zoom_percentage: float = 0.1
+) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.bool_]]:
+    """
+    Scale and translate image and corresponding ground truth mask.
+
+    Zooms in on the image/mask by a random amount between 0 and
+    max_zoom_percentage, then shifts the image/mask by a random amount
+    up to the number of zoomed pixels.
+
+    Parameters
+    ----------
+    image : npt.NDArray[np.float64]
+        Image.
+    ground_truth : npt.NDArray[np.bool_]
+        Mask.
+    max_zoom_percentage : float
+        Maximum zoom percentage.
+
+    Returns
+    -------
+    tuple[npt.NDArray[np.float64], npt.NDArray[np.bool_]]
+        Zoomed and shifted image and mask.
+    """
+    # Choose a zoom percentage and calculate the number of pixels to zoom in
+    zoom = np.random.uniform(0, max_zoom_percentage)
+    zoom_pixels = int(image.shape[0] * zoom)
+
+    # If there is zoom, choose a random shift
+    if int(zoom_pixels) > 0:
+        shift_x = np.random.randint(int(-zoom_pixels), int(zoom_pixels))
+        shift_y = np.random.randint(int(-zoom_pixels), int(zoom_pixels))
+
+        # Zoom and shift the image
+        image = image[
+            zoom_pixels + shift_x : -zoom_pixels + shift_x,
+            zoom_pixels + shift_y : -zoom_pixels + shift_y,
+        ]
+        ground_truth = ground_truth[
+            zoom_pixels + shift_x : -zoom_pixels + shift_x,
+            zoom_pixels + shift_y : -zoom_pixels + shift_y,
+        ]
+
+    return image, ground_truth
+
+
 class SegmentationDataset(torch.utils.data.Dataset):
     """Custom dataset for augmenting the segmentation data."""
 
@@ -235,14 +301,18 @@ class SegmentationDataset(torch.utils.data.Dataset):
         mask_files: list[Path],
         vmin: float,
         vmax: float,
-        augment: bool,
+        augment_flip_rot: bool,
+        augment_scale: bool,
+        augment_max_zoom_percentage: bool,
     ) -> None:
         """Initialise."""
         self.image_files = image_files
         self.mask_files = mask_files
         self.vmin = vmin
         self.vmax = vmax
-        self.augment = augment
+        self.augment_flip_rot = augment_flip_rot
+        self.augment_scale = augment_scale
+        self.augment_max_zoom_percentage = augment_max_zoom_percentage
 
     def __len__(self) -> int:
         """Return the length of the dataset."""
@@ -259,7 +329,7 @@ class SegmentationDataset(torch.utils.data.Dataset):
         # add channel dimension to the image tensor
         image = image.unsqueeze(0)  # [C, H, W]
 
-        if self.augment:
+        if self.augment_flip_rot:
             # horizontal flip
             if torch.rand(1).item() < 0.5:
                 image = image.flip(-1)
@@ -271,6 +341,12 @@ class SegmentationDataset(torch.utils.data.Dataset):
             rotation = int(torch.randint(0, 4, (1,)).item())
             image = torch.rot90(image, rotation, [-2, -1])
             mask = torch.rot90(mask, rotation, [-2, -1])
+        if self.augment_scale:
+            image, mask = zoom_and_shift(
+                image=image,
+                ground_truth=mask,
+                max_zoom_percentage=self.augment_max_zoom_percentage,
+            )
 
         return image, mask
 
