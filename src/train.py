@@ -3,7 +3,7 @@
 from pathlib import Path
 import torch
 import torch.optim as optim
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import DataLoader
 from tqdm import tqdm
 import numpy as np
 import matplotlib.pyplot as plt
@@ -123,54 +123,6 @@ def train_val_split(
     train_masks = masks[val_size:]
 
     return train_images, train_masks, val_images, val_masks
-
-
-# def load_data(image_files: list[Path], mask_files: list[Path], vmin: float, vmax: float) -> TensorDataset:
-#     """
-#     Load the data from the image and mask files, preprocessing it.
-
-#     The images and masks must be corresponding to each other, ie the ith image is for the ith mask.
-
-#     Parameters
-#     ----------
-#     image_files : list[Path]
-#         List of paths to the image files.
-#     mask_files : list[Path]
-#         List of paths to the mask files.
-
-#     Returns
-#     -------
-#     TensorDataset
-#         A TensorDataset containing the images and masks as tensors.
-#     """
-
-#     images = []
-#     masks = []
-
-#     for image_file, mask_file in zip(image_files, mask_files):
-#         # load the image and mask
-#         image = torch.from_numpy(np.load(image_file)).float()
-
-#         assert image.ndim == 2, f"Image must be 2D (H, W), but got {image.ndim}D"
-#         # add channel dim to the image tensor since it won't have one
-#         image = image.unsqueeze(0)  # add channel dimension to the image tensor
-#         mask = torch.from_numpy(np.load(mask_file).astype(bool)).float()
-#         assert mask.ndim == 3, f"Mask must be 3D (C, H, W), but got {mask.ndim}D"
-
-#         assert torch.unique(mask).tolist() == [0.0, 1.0], f"Mask must be binary (0 or 1), but got {torch.unique(mask)}"
-
-#         # clip and normalize
-#         image = torch.clamp(image, vmin, vmax)
-#         image = (image - vmin) / (vmax - vmin)
-
-#         images.append(image)
-#         masks.append(mask)
-
-#     # stack the images and masks into tensors
-#     images = torch.stack(images)
-#     masks = torch.stack(masks)
-
-#     return TensorDataset(images, masks)
 
 
 def get_loaders(
@@ -316,7 +268,7 @@ class SegmentationDataset(torch.utils.data.Dataset):
             if torch.rand(1).item() < 0.5:
                 image = image.flip(-2)
                 mask = mask.flip(-2)
-            rotation = torch.randint(0, 4, (1,)).item()
+            rotation = int(torch.randint(0, 4, (1,)).item())
             image = torch.rot90(image, rotation, [-2, -1])
             mask = torch.rot90(mask, rotation, [-2, -1])
 
