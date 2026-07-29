@@ -8,6 +8,7 @@ from tqdm import tqdm
 import numpy as np
 import numpy.typing as npt
 import matplotlib.pyplot as plt
+from skimage.filters import hessian
 
 from src.resunet import ResUNet
 from src.loss import PermutationInvariantDiceLoss_2_channel
@@ -20,7 +21,7 @@ else:
     DEVICE = torch.device("cpu")
 BATCH_SIZE = 4
 EPOCHS = 100
-LEARNING_RATE = 1e-3
+LEARNING_RATE = 1e-4
 MODEL_SAVE_PATH = "resunet_model.pth"
 BASE_DIR = Path("/Users/sylvi/topo_data/crossings_net")
 PREDICTIONS_DIR = BASE_DIR / "predictions"
@@ -31,19 +32,21 @@ SAMPLE_TYPES = [
     "true_slot",
 ]
 
-NUM_SAMPLES_PER_TYPE = [100, 0]  # number of samples to grab from each sample type
+NUM_SAMPLES_PER_TYPE = [100, 100]  # number of samples to grab from each sample type
 TRAINING_DATA_DIR = BASE_DIR / "training"
 ALLOW_TOO_FEW_SAMPLES = True
 AUGMENTATION_FLIP_ROT = True
-AUGMENTATION_SCALE = True
-AUGMENTATION_SCALE_MAX_ZOOM_PERCENTAGE = 0.1
+AUGMENTATION_SCALE = False
+AUGMENTATION_SCALE_MAX_ZOOM_PERCENTAGE = 0.2
+
+EXTRA_CHANNELS_HESSIAN = True  # whether to add hessian channel to the input images
 
 
 def sample_type_split(
     sample_type_dirs: list[Path],
     num_samples_per_type: list[int],
     allow_too_few_samples: bool = False,
-) -> tuple[list[Path], list[Path]]:
+) -> tuple[list[Path], list[Path], dict[str, int]]:
     """
     Grab images from each sample type for the dataset.
 
@@ -58,9 +61,10 @@ def sample_type_split(
 
     Returns
     -------
-    tuple[list[Path], list[Path]]
+    tuple[list[Path], list[Path], dict[str, int]]
         A tuple containing two lists: the first list contains the paths to the sampled image files,
         and the second list contains the paths to the corresponding mask files.
+        The third element is a dictionary with the number of samples actually used per sample type.
     """
     assert len(sample_type_dirs) == len(
         num_samples_per_type
@@ -68,6 +72,7 @@ def sample_type_split(
 
     sampled_image_files = []
     sampled_mask_files = []
+    num_samples_used = {}
 
     print(f"Sampling {num_samples_per_type} files from each sample type directory in {sample_type_dirs}.")
 
@@ -90,8 +95,9 @@ def sample_type_split(
         sampled_indexes = torch.randperm(len(image_files))[:num_samples]
         sampled_image_files.extend([image_files[i] for i in sampled_indexes])
         sampled_mask_files.extend([mask_files[i] for i in sampled_indexes])
+        num_samples_used[sample_type_dir.name] = num_samples
 
-    return sampled_image_files, sampled_mask_files
+    return sampled_image_files, sampled_mask_files, num_samples_used
 
 
 def train_val_split(
@@ -247,8 +253,8 @@ def validate(
 
 
 def zoom_and_shift(
-    image: npt.NDArray[np.float64], ground_truth: npt.NDArray[np.bool_], max_zoom_percentage: float = 0.1
-) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.bool_]]:
+    image: torch.Tensor, ground_truth: torch.Tensor, max_zoom_percentage: float = 0.1
+) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Scale and translate image and corresponding ground truth mask.
 
@@ -258,36 +264,50 @@ def zoom_and_shift(
 
     Parameters
     ----------
-    image : npt.NDArray[np.float64]
-        Image.
-    ground_truth : npt.NDArray[np.bool_]
-        Mask.
-    max_zoom_percentage : float
-        Maximum zoom percentage.
+    image : torch.Tensor
+        The input image tensor of shape [C, H, W].
+    ground_truth : torch.Tensor
+        The corresponding ground truth mask tensor of shape [C, H, W].
+    max_zoom_percentage : float, optional
+        The maximum percentage of the image to zoom in, by default 0.1.
 
     Returns
     -------
-    tuple[npt.NDArray[np.float64], npt.NDArray[np.bool_]]
-        Zoomed and shifted image and mask.
+    tuple[torch.Tensor, torch.Tensor]
+        The zoomed and shifted image and ground truth mask tensors. [C, H, W]
     """
+    original_size = image.shape[-2:]  # [H, W]
     # Choose a zoom percentage and calculate the number of pixels to zoom in
     zoom = np.random.uniform(0, max_zoom_percentage)
-    zoom_pixels = int(image.shape[0] * zoom)
+    zoom_pixels = int(zoom * image.shape[1])
 
     # If there is zoom, choose a random shift
     if int(zoom_pixels) > 0:
         shift_x = np.random.randint(int(-zoom_pixels), int(zoom_pixels))
         shift_y = np.random.randint(int(-zoom_pixels), int(zoom_pixels))
 
-        # Zoom and shift the image
-        image = image[
-            zoom_pixels + shift_x : -zoom_pixels + shift_x,
-            zoom_pixels + shift_y : -zoom_pixels + shift_y,
-        ]
+        # Zoom and shift  the image and ground truth mask
+        image = image[:, zoom_pixels + shift_y : -zoom_pixels + shift_y, zoom_pixels + shift_x : -zoom_pixels + shift_x]
         ground_truth = ground_truth[
-            zoom_pixels + shift_x : -zoom_pixels + shift_x,
-            zoom_pixels + shift_y : -zoom_pixels + shift_y,
+            :, zoom_pixels + shift_y : -zoom_pixels + shift_y, zoom_pixels + shift_x : -zoom_pixels + shift_x
         ]
+
+        image = torch.nn.functional.interpolate(
+            image.unsqueeze(0),  # add a batch dimension for interpolation
+            size=original_size,
+            mode="bilinear",
+            align_corners=False,  # apparently this is default for bilinear
+        ).squeeze(
+            0
+        )  # remove the batch dimension
+
+        ground_truth = torch.nn.functional.interpolate(
+            ground_truth.unsqueeze(0),  # add a batch dimension for interpolation
+            size=original_size,
+            mode="nearest",  # use nearest neighbour for masks to avoid interpolation artifacts
+        ).squeeze(
+            0
+        )  # remove the batch dimension
 
     return image, ground_truth
 
@@ -320,14 +340,31 @@ class SegmentationDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor]:
         """Get an item from the dataset and augment if needed."""
-        image = torch.from_numpy(np.load(self.image_files[index])).float()  # [H, W]
+        image_original = torch.from_numpy(np.load(self.image_files[index])).float()  # [H, W]
         mask = torch.from_numpy(np.load(self.mask_files[index]).astype(bool)).float()  # [C, H, W]
 
         # normalise the image
+        image = image_original.clone()
         image = torch.clamp(image, self.vmin, self.vmax)
         image = (image - self.vmin) / (self.vmax - self.vmin)
         # add channel dimension to the image tensor
         image = image.unsqueeze(0)  # [C, H, W]
+
+        if EXTRA_CHANNELS_HESSIAN:
+            # Add hessian channel to the image tensor for better feature extraction
+            # Calculate the hessian before normalising the image
+            image_hessian = hessian(
+                image=image_original.squeeze(0).numpy(),
+                sigmas=[1.0],
+                mode="reflect",
+                # beta = 0.1,
+                # scale_step = 1.0,
+                # scale_range = (1, 10),
+            )
+
+            # pack it back into the image tensor
+            image_hessian = torch.from_numpy(image_hessian).float().unsqueeze(0)  # [C, H, W]
+            image = torch.cat((image, image_hessian), dim=0)  # [C, H, W]
 
         if self.augment_flip_rot:
             # horizontal flip
@@ -354,7 +391,7 @@ class SegmentationDataset(torch.utils.data.Dataset):
 def main():
 
     # Grab samples from directories for each sample type
-    train_image_files, train_mask_files = sample_type_split(
+    train_image_files, train_mask_files, num_samples_used = sample_type_split(
         sample_type_dirs=[TRAINING_DATA_DIR / sample_type for sample_type in SAMPLE_TYPES],
         num_samples_per_type=NUM_SAMPLES_PER_TYPE,
         allow_too_few_samples=ALLOW_TOO_FEW_SAMPLES,
@@ -371,7 +408,7 @@ def main():
     )
 
     # initialise model, loss function, and optimiser
-    model = ResUNet(in_channels=1, out_channels=2).to(DEVICE)
+    model = ResUNet(in_channels=2, out_channels=2).to(DEVICE)
     criterion = PermutationInvariantDiceLoss_2_channel()
     # use adam since using batchnorm and relu
     optimiser = optim.Adam(model.parameters(), lr=LEARNING_RATE)
@@ -400,6 +437,20 @@ def main():
             print(f"Saved best model with val loss: {best_val_loss:.4f}")
 
     print("\n--- Training complete ---\n")
+    print(f"Best validation loss: {best_val_loss:.4f}")
+    print("Training stats:")
+    print(f"  - Total epochs: {EPOCHS}")
+    print(f"  - Batch size: {BATCH_SIZE}")
+    print(f"  - Initial learning rate: {LEARNING_RATE}")
+    print(f"  - Model saved to: {MODEL_SAVE_PATH}")
+    print(f"  - Number of samples requested per type: {NUM_SAMPLES_PER_TYPE}")
+    print(f"  - Number of samples actually used per type: {num_samples_used}")
+    print(f"  - Sample types: {SAMPLE_TYPES}")
+    print("  - Extra channels")
+    print(f"    - Hessian : {EXTRA_CHANNELS_HESSIAN}")
+    print("  - Augmentation:")
+    print(f"    - Flip and rotate: {AUGMENTATION_FLIP_ROT}")
+    print(f"    - Scale: {AUGMENTATION_SCALE}")
 
     # Load the best model and evaluate on the validation set
     model.load_state_dict(torch.load(MODEL_SAVE_PATH))
@@ -418,29 +469,35 @@ def main():
 
             # plot the image
             plt.figure(figsize=(12, 8))
-            plt.subplot(1, 5, 1)
+            plt.subplot(1, 6, 1)
             plt.imshow(images[0, 0].cpu(), cmap="gray")
             plt.title("Input Image")
             plt.axis("off")
 
+            # plot the hessian channel
+            plt.subplot(1, 6, 2)
+            plt.imshow(images[0, 1].cpu(), cmap="gray")
+            plt.title("Hessian Channel")
+            plt.axis("off")
+
             # plot the target mask channels
-            plt.subplot(1, 5, 2)
+            plt.subplot(1, 6, 3)
             plt.imshow(targets[0, 0].cpu(), cmap="gray")
             plt.title("Target Mask Channel 1")
             plt.axis("off")
 
-            plt.subplot(1, 5, 3)
+            plt.subplot(1, 6, 4)
             plt.imshow(targets[0, 1].cpu(), cmap="gray")
             plt.title("Target Mask Channel 2")
             plt.axis("off")
 
             # plot the predicted mask channels
-            plt.subplot(1, 5, 4)
+            plt.subplot(1, 6, 5)
             plt.imshow(outputs[0, 0].cpu(), cmap="gray")
             plt.title("Predicted Mask Channel 1")
             plt.axis("off")
 
-            plt.subplot(1, 5, 5)
+            plt.subplot(1, 6, 6)
             plt.imshow(outputs[0, 1].cpu(), cmap="gray")
             plt.title("Predicted Mask Channel 2")
             plt.axis("off")
