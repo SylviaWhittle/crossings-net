@@ -1,5 +1,6 @@
 """Scripts for training the model."""
 
+import random
 from pathlib import Path
 import torch
 import torch.optim as optim
@@ -20,7 +21,7 @@ elif torch.backends.mps.is_available():
 else:
     DEVICE = torch.device("cpu")
 BATCH_SIZE = 4
-EPOCHS = 100
+EPOCHS = 50
 LEARNING_RATE = 1e-4
 MODEL_SAVE_PATH = "resunet_model.pth"
 BASE_DIR = Path("/Users/sylvi/topo_data/crossings_net")
@@ -33,6 +34,7 @@ SAMPLE_TYPES = [
 ]
 
 NUM_SAMPLES_PER_TYPE = [100, 100]  # number of samples to grab from each sample type
+SEED = 0
 TRAINING_DATA_DIR = BASE_DIR / "training"
 ALLOW_TOO_FEW_SAMPLES = True
 AUGMENTATION_FLIP_ROT = True
@@ -40,6 +42,18 @@ AUGMENTATION_SCALE = False
 AUGMENTATION_SCALE_MAX_ZOOM_PERCENTAGE = 0.2
 
 EXTRA_CHANNELS_HESSIAN = True  # whether to add hessian channel to the input images
+EXTRA_CHANNELS_HESSIAN_NORMALISED = True
+
+IN_CHANNELS = 1 + int(EXTRA_CHANNELS_HESSIAN)
+OUT_CHANNELS = 2
+
+
+def seed_everything(seed: int) -> None:
+    """Set the random seed for reproducibility."""
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+    random.seed(seed)
 
 
 def sample_type_split(
@@ -362,8 +376,13 @@ class SegmentationDataset(torch.utils.data.Dataset):
                 # scale_range = (1, 10),
             )
 
-            # pack it back into the image tensor
+            # put it into the image tensor
             image_hessian = torch.from_numpy(image_hessian).float().unsqueeze(0)  # [C, H, W]
+            # normalise the hessian channel if needed
+            if EXTRA_CHANNELS_HESSIAN_NORMALISED:
+                image_hessian = torch.clamp(image_hessian, self.vmin, self.vmax)
+                image_hessian = (image_hessian - self.vmin) / (self.vmax - self.vmin)
+            # concatenate the hessian channel to the image tensor
             image = torch.cat((image, image_hessian), dim=0)  # [C, H, W]
 
         if self.augment_flip_rot:
@@ -390,6 +409,8 @@ class SegmentationDataset(torch.utils.data.Dataset):
 
 def main():
 
+    seed_everything(SEED)
+
     # Grab samples from directories for each sample type
     train_image_files, train_mask_files, num_samples_used = sample_type_split(
         sample_type_dirs=[TRAINING_DATA_DIR / sample_type for sample_type in SAMPLE_TYPES],
@@ -408,7 +429,7 @@ def main():
     )
 
     # initialise model, loss function, and optimiser
-    model = ResUNet(in_channels=2, out_channels=2).to(DEVICE)
+    model = ResUNet(in_channels=IN_CHANNELS, out_channels=OUT_CHANNELS).to(DEVICE)
     criterion = PermutationInvariantDiceLoss_2_channel()
     # use adam since using batchnorm and relu
     optimiser = optim.Adam(model.parameters(), lr=LEARNING_RATE)
@@ -439,6 +460,8 @@ def main():
     print("\n--- Training complete ---\n")
     print(f"Best validation loss: {best_val_loss:.4f}")
     print("Training stats:")
+    print(f"  - Device: {DEVICE}")
+    print(f"  - Seed: {SEED}")
     print(f"  - Total epochs: {EPOCHS}")
     print(f"  - Batch size: {BATCH_SIZE}")
     print(f"  - Initial learning rate: {LEARNING_RATE}")
@@ -448,6 +471,7 @@ def main():
     print(f"  - Sample types: {SAMPLE_TYPES}")
     print("  - Extra channels")
     print(f"    - Hessian : {EXTRA_CHANNELS_HESSIAN}")
+    print(f"      - Hessian normalised : {EXTRA_CHANNELS_HESSIAN_NORMALISED}")
     print("  - Augmentation:")
     print(f"    - Flip and rotate: {AUGMENTATION_FLIP_ROT}")
     print(f"    - Scale: {AUGMENTATION_SCALE}")
@@ -474,11 +498,12 @@ def main():
             plt.title("Input Image")
             plt.axis("off")
 
-            # plot the hessian channel
-            plt.subplot(1, 6, 2)
-            plt.imshow(images[0, 1].cpu(), cmap="gray")
-            plt.title("Hessian Channel")
-            plt.axis("off")
+            if EXTRA_CHANNELS_HESSIAN:
+                # plot the hessian channel
+                plt.subplot(1, 6, 2)
+                plt.imshow(images[0, 1].cpu(), cmap="gray")
+                plt.title("Hessian Channel")
+                plt.axis("off")
 
             # plot the target mask channels
             plt.subplot(1, 6, 3)
