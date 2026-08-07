@@ -7,7 +7,6 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 import numpy as np
-import numpy.typing as npt
 import matplotlib.pyplot as plt
 from skimage.filters import hessian
 
@@ -42,6 +41,7 @@ AUGMENTATION_SCALE = False
 AUGMENTATION_SCALE_MAX_ZOOM_PERCENTAGE = 0.2
 
 EXTRA_CHANNELS_HESSIAN = True  # whether to add hessian channel to the input images
+EXTRA_CHANNELS_HESSIAN_SIGMAS = [3.0]  # list of sigmas to use for the hessian filter
 EXTRA_CHANNELS_HESSIAN_NORMALISED = True
 
 IN_CHANNELS = 1 + int(EXTRA_CHANNELS_HESSIAN)
@@ -369,7 +369,7 @@ class SegmentationDataset(torch.utils.data.Dataset):
             # Calculate the hessian before normalising the image
             image_hessian = hessian(
                 image=image_original.squeeze(0).numpy(),
-                sigmas=[1.0],
+                sigmas=EXTRA_CHANNELS_HESSIAN_SIGMAS,
                 mode="reflect",
                 # beta = 0.1,
                 # scale_step = 1.0,
@@ -472,6 +472,7 @@ def main():
     print("  - Extra channels")
     print(f"    - Hessian : {EXTRA_CHANNELS_HESSIAN}")
     print(f"      - Hessian normalised : {EXTRA_CHANNELS_HESSIAN_NORMALISED}")
+    print(f"      - Hessian sigmas : {EXTRA_CHANNELS_HESSIAN_SIGMAS}")
     print("  - Augmentation:")
     print(f"    - Flip and rotate: {AUGMENTATION_FLIP_ROT}")
     print(f"    - Scale: {AUGMENTATION_SCALE}")
@@ -484,54 +485,65 @@ def main():
     # Plot some predictions from the validation set
     model.eval()
     with torch.no_grad():
+        num_rows = len(val_loader)
+        num_cols = IN_CHANNELS + OUT_CHANNELS * 2
+        plt.figure(figsize=(15, 5 * num_rows))
         for i, (images, targets) in enumerate(val_loader):
+            col_index = 0
             images = images.to(DEVICE)
             targets = targets.to(DEVICE)
 
             outputs = model(images)
-            outputs = torch.sigmoid(outputs)  # convert logits to probabilities
+            outputs = torch.sigmoid(outputs)  # convert logits to probabilities since logits are in the
+            # range (-inf, inf) and we want probabilities in the range (0, 1)
 
             # plot the image
-            plt.figure(figsize=(12, 8))
-            plt.subplot(1, 6, 1)
+
+            plt.subplot(num_rows, num_cols, i * num_cols + col_index + 1)
             plt.imshow(images[0, 0].cpu(), cmap="gray")
             plt.title("Input Image")
             plt.axis("off")
+            col_index += 1
 
             if EXTRA_CHANNELS_HESSIAN:
                 # plot the hessian channel
-                plt.subplot(1, 6, 2)
+                plt.subplot(num_rows, num_cols, i * num_cols + col_index + 1)
                 plt.imshow(images[0, 1].cpu(), cmap="gray")
                 plt.title("Hessian Channel")
                 plt.axis("off")
+                col_index += 1
 
             # plot the target mask channels
-            plt.subplot(1, 6, 3)
+            plt.subplot(num_rows, num_cols, i * num_cols + col_index + 1)
             plt.imshow(targets[0, 0].cpu(), cmap="gray")
             plt.title("Target Mask Channel 1")
             plt.axis("off")
+            col_index += 1
 
-            plt.subplot(1, 6, 4)
+            plt.subplot(num_rows, num_cols, i * num_cols + col_index + 1)
             plt.imshow(targets[0, 1].cpu(), cmap="gray")
             plt.title("Target Mask Channel 2")
             plt.axis("off")
+            col_index += 1
 
             # plot the predicted mask channels
-            plt.subplot(1, 6, 5)
+            plt.subplot(num_rows, num_cols, i * num_cols + col_index + 1)
             plt.imshow(outputs[0, 0].cpu(), cmap="gray")
             plt.title("Predicted Mask Channel 1")
             plt.axis("off")
+            col_index += 1
 
-            plt.subplot(1, 6, 6)
+            plt.subplot(num_rows, num_cols, i * num_cols + col_index + 1)
             plt.imshow(outputs[0, 1].cpu(), cmap="gray")
             plt.title("Predicted Mask Channel 2")
             plt.axis("off")
+            col_index += 1
 
-            plt.tight_layout()
-            # save the figure
-            # create a guid for the image based on index and epoch
-            image_guid = f"epoch{epoch+1}_batch{i+1}"
-            plt.savefig(PREDICTIONS_DIR / f"prediction_{image_guid}.png")
+        plt.tight_layout()
+        # save the figure
+        # create a guid for the image based on index and epoch
+        image_guid = f"val_predictions_epoch_{EPOCHS}"
+        plt.savefig(PREDICTIONS_DIR / f"prediction_{image_guid}.png")
 
 
 if __name__ == "__main__":
